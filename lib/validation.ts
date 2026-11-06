@@ -67,7 +67,10 @@ export const createEventSchema = z.object({
   title: z.string().min(1, "El título es obligatorio"),
   description: z.string().optional(),
   date: z.coerce.date("date debe ser una fecha válida"),
-  type: eventTypeSchema,
+  endTime: z.string().regex(/^\d{2}:\d{2}$/, "endTime debe tener formato HH:mm").optional(),
+  category: z.string().optional(),
+  color: z.number().int().optional(),
+  type: eventTypeSchema.default("OTHER"),
 });
 
 export const updateEventSchema = createEventSchema.partial();
@@ -84,6 +87,62 @@ export const listEventsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
 });
 
+export const chatMessageSchema = z.object({
+  message: z.string().min(1, "El mensaje no puede estar vacío").max(2000, "Mensaje demasiado largo"),
+  // Si se omite, se crea una conversación nueva automáticamente
+  conversationId: z.string().min(1).optional(),
+  // Modelo elegido en la app ("auto" = automático). Se valida en el servidor.
+  model: z.string().min(1).max(100).optional(),
+});
+
+export const updateChatActionSchema = z.object({
+  actionStatus: z.enum(["DONE", "DISCARDED"], "actionStatus debe ser DONE o DISCARDED"),
+});
+
+export const verifyEmailSchema = z.object({
+  code: z.string().length(6, "El código debe tener 6 dígitos"),
+});
+
+export const categoriaConocimientoSchema = z.enum([
+  "TRAMITES",
+  "REGLAMENTO",
+  "CALENDARIO",
+  "CONTACTOS",
+  "CAMPUS",
+  "OTRO",
+]);
+
+export const crearConocimientoSchema = z.object({
+  titulo: z.string().min(1, "El título es obligatorio").max(200),
+  categoria: categoriaConocimientoSchema,
+  contenido: z.string().min(1, "El contenido es obligatorio"),
+  activo: z.boolean().default(true),
+  version: z.coerce.number().int().min(1).default(1),
+});
+
+export const actualizarConocimientoSchema = z.object({
+  titulo: z.string().min(1).max(200).optional(),
+  categoria: categoriaConocimientoSchema.optional(),
+  contenido: z.string().min(1).optional(),
+  activo: z.boolean().optional(),
+  version: z.coerce.number().int().min(1).optional(),
+});
+
+export const listarConocimientoQuerySchema = z.object({
+  categoria: categoriaConocimientoSchema.optional(),
+  activo: z.coerce.boolean().optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+export type CrearConocimientoInput = z.infer<typeof crearConocimientoSchema>;
+export type ActualizarConocimientoInput = z.infer<
+  typeof actualizarConocimientoSchema
+>;
+export type ListarConocimientoQuery = z.infer<
+  typeof listarConocimientoQuerySchema
+>;
+
 export type RegisterInput = z.infer<typeof registerSchema>;
 export type LoginInput = z.infer<typeof loginSchema>;
 export type UpdateProfileInput = z.infer<typeof updateProfileSchema>;
@@ -92,3 +151,6 @@ export type ListNotesQuery = z.infer<typeof listNotesQuerySchema>;
 export type CreateEventInput = z.infer<typeof createEventSchema>;
 export type UpdateEventInput = z.infer<typeof updateEventSchema>;
 export type ListEventsQuery = z.infer<typeof listEventsQuerySchema>;
+export type ChatMessageInput = z.infer<typeof chatMessageSchema>;
+export type UpdateChatActionInput = z.infer<typeof updateChatActionSchema>;
+export type VerifyEmailInput = z.infer<typeof verifyEmailSchema>;

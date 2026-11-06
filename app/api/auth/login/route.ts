@@ -21,6 +21,7 @@ export async function POST(request: NextRequest) {
       carrera: user.carrera,
       semestre: user.semestre,
       fotoUrl: user.fotoUrl,
+      emailVerified: user.emailVerified,
     };
 
     return ok({ token, user: safeUser });

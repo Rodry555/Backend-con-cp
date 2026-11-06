@@ -1,0 +1,396 @@
+import { prisma } from "@/lib/prisma";
+import { requireAuth } from "@/lib/auth";
+import { chatMessageSchema } from "@/lib/validation";
+import { errorResponse, ok, ApiError } from "@/lib/api-response";
+import { getAiModels, type AiModelOption } from "@/lib/ai-models";
+import { seleccionarContexto } from "@/lib/conocimiento";
+import type { NextRequest } from "next/server";
+
+// Los modelos disponibles se configuran en lib/ai-models.ts (variables GEMINI_MODELS, etc.).
+// Cuántos mensajes anteriores de la conversación se le mandan a Gemini como contexto.
+const HISTORY_LIMIT = 10;
+const geminiUrl = (model: string) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+
+// Tiempo máximo de la función en Vercel (los reintentos pueden tardar unos segundos).
+export const maxDuration = 30;
+
+// Gemini (sobre todo en el plan gratuito) a veces responde 503 "high demand".
+// Se reintenta hasta 3 veces con espera creciente (1 s, 2 s).
+const RETRYABLE_STATUS = new Set([500, 503, 504]);
+const MAX_ATTEMPTS = 3;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Tiempo máximo por intento y total, para que la función siempre responda
+// (con un error claro) antes de que Vercel la corte.
+const ATTEMPT_TIMEOUT_MS = 10_000;
+const TOTAL_BUDGET_MS = 24_000;
+
+interface GeminiAttempt {
+  res: Response;
+  model: AiModelOption;
+}
+
+// Prueba los modelos recibidos en orden. Con un solo modelo (el usuario eligió
+// uno) solo se usa ese; con varios ("Automático") pasa al siguiente si uno
+// está sin cuota (429) o saturado.
+type ChatTurn = { role: "user" | "model"; parts: { text: string }[] };
+
+// Arma la petición según el proveedor del modelo (Gemini o Groq, que usa formato OpenAI).
+function buildRequest(
+  model: AiModelOption,
+  keys: { gemini?: string; groq?: string },
+  history: ChatTurn[],
+  message: string,
+  contexto?: string,
+): { url: string; init: RequestInit } {
+  if (model.provider === "groq") {
+    const system = `${buildSystemPrompt(contexto)}
+
+FORMATO DE SALIDA: responde SIEMPRE solo con un objeto JSON válido (sin texto extra ni markdown) con estas claves:
+reply (string, obligatorio), chatTitle (string, opcional), actionType ("ninguna" | "crear_evento" | "crear_nota", obligatorio),
+eventTitle, eventDate (ISO 8601), eventType ("EXAM" | "ASSIGNMENT" | "CLASS" | "REMINDER" | "OTHER"),
+noteTitle, noteCourse, noteContent (string, obligatorio; vacío "" si actionType no es "crear_nota").`;
+    return {
+      url: GROQ_URL,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${keys.groq}` },
+        body: JSON.stringify({
+          model: model.id,
+          messages: [
+            { role: "system", content: system },
+            ...history.map((h) => ({
+              role: h.role === "model" ? "assistant" : "user",
+              content: h.parts[0].text,
+            })),
+            { role: "user", content: message },
+          ],
+          response_format: { type: "json_object" },
+          max_tokens: 2048,
+        }),
+      },
+    };
+  }
+
+  return {
+    url: `${geminiUrl(model.id)}?key=${keys.gemini}`,
+    init: {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: buildSystemPrompt(contexto) }] },
+        contents: [...history, { role: "user", parts: [{ text: message }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: RESPONSE_SCHEMA,
+          // Sin este límite, Gemini puede cortar la respuesta a la mitad de
+          // "noteContent" y el JSON queda incompleto -> JSON.parse() explota.
+          maxOutputTokens: 2048,
+        },
+      }),
+    },
+  };
+}
+
+async function fetchAi(
+  keys: { gemini?: string; groq?: string },
+  models: AiModelOption[],
+  history: ChatTurn[],
+  message: string,
+  contexto?: string,
+): Promise<GeminiAttempt> {
+  const deadline = Date.now() + TOTAL_BUDGET_MS;
+  let last: GeminiAttempt | null = null;
+
+  outer: for (const model of models) {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      if (Date.now() > deadline) break outer;
+      if (attempt > 1) await sleep((attempt - 1) * 1000);
+
+      let res: Response;
+      try {
+        const { url, init } = buildRequest(model, keys, history, message, contexto);
+        res = await fetch(url, { ...init, signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS) });
+      } catch (err) {
+        console.error(`${model.provider} ${model.id} sin respuesta (intento ${attempt}/${MAX_ATTEMPTS}):`, err);
+        continue; // timeout o error de red: se reintenta
+      }
+
+      if (res.ok) return { res, model };
+      last = { res, model };
+      console.error(`${model.provider} ${model.id} falló (intento ${attempt}/${MAX_ATTEMPTS}): ${res.status}`);
+
+      // 429 = cuota agotada: reintentar el mismo modelo no sirve, pasa al siguiente.
+      if (res.status === 429 || !RETRYABLE_STATUS.has(res.status)) break;
+    }
+  }
+
+  if (!last) {
+    throw new ApiError(
+      "AI_BUSY",
+      "La IA tardó demasiado en responder. Intenta de nuevo o elige otro modelo.",
+      504,
+    );
+  }
+  return last;
+}
+
+function buildSystemPrompt(contexto?: string): string {
+  const hoy = new Date().toISOString().split("T")[0]; // ej: 2026-08-16
+
+  let prompt = `Eres el asistente de UPEA-Connect, una app universitaria de la UPEA (Bolivia).
+Ayudas a estudiantes con dudas académicas de forma breve y clara, en español.
+
+La fecha de hoy es ${hoy}. Usa este dato como referencia para calcular cualquier
+fecha relativa que mencione el usuario ("el próximo lunes", "mañana", "el 20 de agosto", etc.).
+Nunca asumas un año distinto al que corresponde según la fecha de hoy, salvo que el
+usuario lo diga explícitamente.
+
+Si el usuario te pide crear un EVENTO (examen, tarea, clase, recordatorio) en su calendario,
+extrae los datos que mencione y regrésalos en el campo correspondiente.
+Si falta algún dato importante (como la fecha de un evento), pregúntalo en tu respuesta de texto
+en vez de inventarlo, y deja actionType en "ninguna".
+
+Si el usuario te pide crear un APUNTE/NOTA sobre un tema, además del título y la materia,
+genera en "noteContent" un resumen inicial breve y útil sobre ese tema (2 a 4 párrafos,
+en texto plano, con la información académica más relevante para empezar a estudiar).
+No dejes "noteContent" vacío cuando actionType sea "crear_nota".
+
+Si el mensaje del usuario depende de lo dicho antes en la conversación (por ejemplo "y para el martes?"),
+usa el historial para entenderlo.
+
+Si es el primer mensaje de la conversación, devuelve también "chatTitle": un título corto
+(máximo 5 palabras, sin comillas ni punto final) que resuma de qué trata.
+
+No respondas temas fuera de lo académico o de la app. Sé breve: máximo 3-4 oraciones en "reply".`;
+
+  if (contexto) {
+    prompt += `
+
+CONOCIMIENTO OFICIAL DE LA UPEA
+Usa la siguiente información oficial de la UPEA para responder datos específicos
+(trámites, reglamentos, calendario, contactos, campus, otros):
+
+${contexto}
+
+Reglas: usa esa información para datos específicos de la UPEA; si la respuesta no
+está ahí, di que no tienes ese dato y sugiere consultar en secretaría o el canal
+oficial; nunca inventes trámites, fechas, costos ni contactos.`;
+  }
+
+  return prompt;
+}
+// Esquema de salida forzado: Gemini SIEMPRE responde en este formato JSON.
+// Esto es lo que le permite a la app mostrar la tarjetita de "crear evento/nota".
+const RESPONSE_SCHEMA = {
+  type: "object",
+  properties: {
+    reply: { type: "string", description: "Respuesta conversacional para mostrar al usuario" },
+    chatTitle: {
+      type: "string",
+      description: "Título corto (máx. 5 palabras) de la conversación. Solo relevante en el primer mensaje.",
+    },
+    actionType: {
+      type: "string",
+      enum: ["ninguna", "crear_evento", "crear_nota"],
+    },
+    eventTitle: { type: "string" },
+    eventDate: { type: "string", description: "Fecha y hora en formato ISO 8601, ej: 2026-08-20T10:00:00" },
+    eventType: { type: "string", enum: ["EXAM", "ASSIGNMENT", "CLASS", "REMINDER", "OTHER"] },
+    noteTitle: { type: "string" },
+    noteCourse: { type: "string" },
+    noteContent: {
+      type: "string",
+      description: "Resumen inicial del tema, en texto plano, para el cuerpo de la nota. Obligatorio si actionType es crear_nota.",
+    },
+  },
+  required: ["reply", "actionType", "noteContent"],
+};
+
+interface GeminiResponse {
+  reply: string;
+  chatTitle?: string;
+  actionType: "ninguna" | "crear_evento" | "crear_nota";
+  eventTitle?: string;
+  eventDate?: string;
+  eventType?: string;
+  noteTitle?: string;
+  noteCourse?: string;
+  noteContent?: string;
+}
+
+// Título de la conversación: el que sugiere Gemini; si viene vacío, el inicio del mensaje.
+function buildTitle(suggested: string | undefined, message: string): string {
+  const clean = (suggested ?? "").replace(/["“”.]/g, "").trim();
+  const base = clean.length > 0 ? clean : message.trim();
+  return base.length > 60 ? `${base.slice(0, 57)}...` : base;
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const userId = await requireAuth(request);
+    const { message, conversationId, model } = chatMessageSchema.parse(await request.json());
+
+    // Modelo elegido en la app: "auto" (o sin valor) = probar todos en orden.
+    // Se valida contra la lista del servidor: el cliente no puede pedir cualquier modelo.
+    const availableModels = getAiModels();
+    let candidates = availableModels;
+    if (model && model !== "auto") {
+      const chosen = availableModels.find((m) => m.id === model);
+      if (!chosen) {
+        throw new ApiError("INVALID_MODEL", "Ese modelo ya no está disponible. Elige otro.", 400);
+      }
+      candidates = [chosen];
+    }
+
+    const keys = { gemini: process.env.GEMINI_API_KEY, groq: process.env.GROQ_API_KEY };
+    // Se descartan los modelos cuyo proveedor no tiene API key configurada.
+    candidates = candidates.filter((m) => (m.provider === "groq" ? keys.groq : keys.gemini));
+    if (candidates.length === 0) {
+      throw new ApiError("CONFIG_ERROR", "API key de IA no configurada en el servidor", 500);
+    }
+
+    // Historial: si la conversación ya existe, se cargan los últimos mensajes
+    // (y se verifica que pertenezca al usuario).
+    let history: ChatTurn[] = [];
+    if (conversationId) {
+      const owned = await prisma.chatConversation.findFirst({
+        where: { id: conversationId, userId },
+        select: { id: true },
+      });
+      if (!owned) {
+        throw new ApiError("NOT_FOUND", "Conversación no encontrada", 404);
+      }
+
+      const previous = await prisma.chatMessage.findMany({
+        where: { conversationId },
+        orderBy: { createdAt: "desc" },
+        take: HISTORY_LIMIT,
+        select: { role: true, text: true },
+      });
+
+      history = previous.reverse().map((m) => ({
+        role: m.role === "USER" ? "user" : "model",
+        parts: [{ text: m.text }],
+      }));
+      // Gemini espera que el contexto empiece con un turno del usuario.
+      while (history.length > 0 && history[0].role === "model") history.shift();
+    }
+
+    const { res: geminiRes, model: usedModel } = await fetchAi(
+      keys,
+      candidates,
+      history,
+      message,
+      await seleccionarContexto(message),
+    );
+
+    if (!geminiRes.ok) {
+      const errText = await geminiRes.text();
+      console.error(`${usedModel.provider} API error:`, errText);
+
+      const modelName = candidates.length > 1 ? "Todos los modelos" : `El modelo «${usedModel.label}»`;
+
+      if (geminiRes.status === 429) {
+        throw new ApiError(
+          "AI_QUOTA",
+          `${modelName} alcanzó su límite de uso por hoy. ${candidates.length > 1 ? "Intenta más tarde." : "Elige otro modelo o intenta más tarde."}`,
+          429,
+        );
+      }
+      if (geminiRes.status === 503) {
+        throw new ApiError(
+          "AI_BUSY",
+          `${modelName} está saturado en este momento. ${candidates.length > 1 ? "Intenta de nuevo en unos segundos." : "Prueba con otro modelo o reintenta en unos segundos."}`,
+          503,
+        );
+      }
+      throw new ApiError("AI_ERROR", "El asistente no pudo responder. Intenta de nuevo", 502);
+    }
+
+    const geminiData = await geminiRes.json();
+    const rawText: string | undefined =
+      usedModel.provider === "groq"
+        ? geminiData?.choices?.[0]?.message?.content
+        : geminiData?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!rawText) {
+      throw new ApiError("AI_ERROR", "El asistente no pudo responder. Intenta de nuevo", 502);
+    }
+
+    const parsed: GeminiResponse = JSON.parse(rawText);
+
+    // Traduce la respuesta de Gemini al formato que ya espera Flutter
+    // (el mismo formato que usaba el mock: { reply, action: { type, data } })
+    let action: { type: string; data: Record<string, string> } | null = null;
+
+    if (parsed.actionType === "crear_evento" && parsed.eventTitle && parsed.eventDate) {
+      action = {
+        type: "crear_evento",
+        data: {
+          titulo: parsed.eventTitle,
+          fecha: parsed.eventDate,
+          tipo: parsed.eventType ?? "OTHER",
+        },
+      };
+    } else if (parsed.actionType === "crear_nota" && parsed.noteTitle && parsed.noteContent) {
+      action = {
+        type: "crear_nota",
+        data: {
+          titulo: parsed.noteTitle,
+          materia: parsed.noteCourse ?? "General",
+          contenido: parsed.noteContent,
+        },
+      };
+    }
+
+    // Se guardan ambos mensajes solo si Gemini respondió bien, así el historial
+    // siempre queda alternando usuario/asistente. Fechas con 1 ms de diferencia
+    // para que el orden sea estable.
+    const now = Date.now();
+    const messagesData = [
+      { role: "USER" as const, text: message, createdAt: new Date(now) },
+      {
+        role: "ASSISTANT" as const,
+        text: parsed.reply,
+        createdAt: new Date(now + 1),
+        ...(action ? { action, actionStatus: "PENDING" as const } : {}),
+      },
+    ];
+
+    const lastTwo = {
+      orderBy: { createdAt: "desc" },
+      take: 2,
+      select: { id: true, role: true },
+    } as const;
+
+    const conversation = conversationId
+      ? await prisma.chatConversation.update({
+          where: { id: conversationId },
+          data: { updatedAt: new Date(), messages: { create: messagesData } },
+          select: { id: true, title: true, messages: lastTwo },
+        })
+      : await prisma.chatConversation.create({
+          data: {
+            userId,
+            title: buildTitle(parsed.chatTitle, message),
+            messages: { create: messagesData },
+          },
+          select: { id: true, title: true, messages: lastTwo },
+        });
+
+    return ok({
+      reply: parsed.reply,
+      action,
+      conversationId: conversation.id,
+      title: conversation.title,
+      model: usedModel.id,
+      userMessageId: conversation.messages.find((m) => m.role === "USER")?.id ?? null,
+      assistantMessageId: conversation.messages.find((m) => m.role === "ASSISTANT")?.id ?? null,
+    });
+  } catch (error) {
+    return errorResponse(error);
+  }
+}
